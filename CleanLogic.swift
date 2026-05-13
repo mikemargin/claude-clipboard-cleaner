@@ -160,17 +160,28 @@ func displayWidth(_ s: String) -> Int {
 /// A line is a wrap continuation of the previous one when either:
 ///   - Word-fit: `prev_width + first_word_width` overflows the estimated wrap
 ///     column (the terminal had no choice but to break).
-///   - Hanging-indent residue: ≥2 leading spaces remain after the caller's
-///     2-space strip (originally a 4+ space hanging indent). Covers cases
-///     where the wrap break lands on a short word so word-fit doesn't fire.
+///   - Hanging-indent: line's leading whitespace exceeds the document's
+///     baseline indent (originally a deeper hanging indent than surrounding
+///     content). Covers cases where the wrap break lands on a short word so
+///     word-fit doesn't fire.
 func unwrapParagraphLines(_ text: String) -> String {
     let lines = text.components(separatedBy: "\n")
     guard lines.count >= 2 else { return text }
 
-    // Wrap column = longest non-fenced line. Path A's terminalWidth from the
-    // padded-line count is intentionally not used: padded lines can exceed the
-    // original wrap point and would falsely suppress detection.
+    // Single pass over non-fenced lines computes both the wrap column (longest
+    // line) and the indent baseline (min leading whitespace). Path A's
+    // terminalWidth from the padded-line count is intentionally not used:
+    // padded lines can exceed the original wrap point and would falsely
+    // suppress detection.
+    //
+    // Indent baseline matters because residual leading whitespace is only a
+    // hanging-indent signal *relative* to surrounding content. Uniformly-
+    // indented input (e.g. a 4-space heredoc) lands every line at the same
+    // residue depth after Path A's 2-space strip — that's the baseline, not
+    // a continuation marker, and treating it as one joins lines that the
+    // terminal had no reason to wrap.
     var maxWidth = 0
+    var baseline = Int.max
     var inFenceForMax = false
     for line in lines {
         let t = line.trimmingCharacters(in: .whitespaces)
@@ -178,11 +189,17 @@ func unwrapParagraphLines(_ text: String) -> String {
         if inFenceForMax { continue }
         let w = displayWidth(line)
         if w > maxWidth { maxWidth = w }
+        if !line.isEmpty {
+            let leading = line.prefix(while: { $0 == " " }).count
+            if leading < baseline { baseline = leading }
+        }
     }
     let wrapColumn = max(maxWidth, 40)
+    let indentBaseline = baseline == Int.max ? 0 : baseline
 
     var result: [String] = []
     var prevWidth = 0
+    var prevLeadingWS = 0
     var inCodeBlock = false
 
     for line in lines {
@@ -191,12 +208,14 @@ func unwrapParagraphLines(_ text: String) -> String {
             inCodeBlock = !inCodeBlock
             result.append(line)
             prevWidth = 0
+            prevLeadingWS = 0
             continue
         }
 
         if inCodeBlock {
             result.append(line)
             prevWidth = 0
+            prevLeadingWS = 0
             continue
         }
 
@@ -209,15 +228,22 @@ func unwrapParagraphLines(_ text: String) -> String {
             && firstWord > 0
             && (prevWidth + 1 + firstWord) > wrapColumn - 10
 
-        let isHangingContinuation = line.hasPrefix("  ")
+        let leadingWS = line.prefix(while: { $0 == " " }).count
+        let isHangingContinuation = leadingWS > indentBaseline
             && !result.isEmpty
             && !result.last!.isEmpty
             && !isStructural
+
+        // Indent reset (deeper-than-baseline → at-or-below-baseline) ends a
+        // hanging-indent block. Force a paragraph break even if word-fit math
+        // would have joined — the indent reset is the stronger semantic signal.
+        let indentReset = leadingWS <= indentBaseline && prevLeadingWS > indentBaseline
 
         let shouldJoin = !line.isEmpty
             && !isStructural
             && !result.isEmpty
             && !result.last!.isEmpty
+            && !indentReset
             && (wouldNotFit || isHangingContinuation)
 
         // Strip residual leading whitespace (hanging-indent residue from a wrap).
@@ -234,6 +260,7 @@ func unwrapParagraphLines(_ text: String) -> String {
         // drawing lines reset (real paragraph breaks); other structural lines
         // keep their width so their own wrapped continuations can join.
         prevWidth = (line.isEmpty || isBoxDrawingLine(line)) ? 0 : displayWidth(line)
+        prevLeadingWS = line.isEmpty ? 0 : leadingWS
     }
 
     return result.joined(separator: "\n")
@@ -287,11 +314,23 @@ func isStructuralLine(_ line: String) -> Bool {
 
 // MARK: - Path B: Leading 2-Space Pattern
 
-/// 60%+ of non-empty lines have exactly 2 leading spaces (not 3+).
-/// "Exactly 2" (not "≥2") is what separates Claude prose from indented code:
-/// code samples have mixed depths (2/4/6), so few lines hit exactly-2.
+/// Claude prose: every non-empty content line has leading whitespace, 60%+
+/// have ≥2 leading spaces, and at least 3 have *exactly* 2 leading spaces.
+///
+/// Three-part rule, each guarding a different failure mode:
+///   - No zero-leading content lines: Claude responses indent every prose
+///     line. A line at column 0 (e.g. `function foo() {`) signals non-Claude
+///     content. Structural lines (⏺/■ markers, headings, code fences) are
+///     exempt — those legitimately sit at column 0 in real responses.
+///   - Ratio (≥2 leading): counts list/bullet continuations toward detection.
+///     Numbered lists hang continuations at 5 spaces, bullets at 4. A strict
+///     "exactly 2" ratio drops below threshold on responses with long lists.
+///   - Absolute floor (≥3 exactly-2): establishes prose-level content exists,
+///     not just deeper-indented blocks. An all-4-space code block has zero
+///     exactly-2 lines and gets rejected even if every line is ≥2 leading.
 func hasLeadingTwoSpacePattern(_ lines: [String]) -> Bool {
-    var twoSpaceCount = 0
+    var exactlyTwoCount = 0
+    var atLeastTwoCount = 0
     var nonEmptyCount = 0
 
     for line in lines {
@@ -299,14 +338,17 @@ func hasLeadingTwoSpacePattern(_ lines: [String]) -> Bool {
         guard !trimmed.isEmpty else { continue }
         nonEmptyCount += 1
 
-        if line.hasPrefix("  ") && !line.hasPrefix("   ") {
-            twoSpaceCount += 1
+        if line.hasPrefix("  ") {
+            atLeastTwoCount += 1
+            if !line.hasPrefix("   ") {
+                exactlyTwoCount += 1
+            }
+        } else if !line.hasPrefix(" ") && !isStructuralLine(line) {
+            // Zero-leading non-structural line disqualifies Claude pattern.
+            return false
         }
     }
 
-    // Floor of 3 (was 4): short Claude paragraphs with one hanging-indent
-    // continuation otherwise miss detection. Ratio gate still rejects code
-    // (covered by test B4).
-    guard twoSpaceCount >= 3 else { return false }
-    return Double(twoSpaceCount) / Double(max(nonEmptyCount, 1)) >= 0.6
+    guard exactlyTwoCount >= 3 else { return false }
+    return Double(atLeastTwoCount) / Double(max(nonEmptyCount, 1)) >= 0.6
 }

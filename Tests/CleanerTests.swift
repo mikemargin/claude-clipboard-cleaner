@@ -150,6 +150,35 @@ group("B5: Below 60% ratio") {
     check(cleanClaudeOutput(input) == nil, "40% rejected")
 }
 
+group("B6: Numbered list with 5-space continuations — relaxed ratio fires") {
+    // Real failure mode: Claude formats numbered lists with hanging
+    // continuations at 5 leading spaces. "Exactly 2" ratio dropped below
+    // 60% when continuations dominated. The relaxed rule counts >=2
+    // leading toward the ratio (continuations still vote) while keeping a
+    // >=3 exactly-2 absolute floor (so an all-deeper-indent code block
+    // still gets rejected per B4).
+    let input =
+        "  Three follow-ups uncovered while testing:\n" +
+        "\n" +
+        "  1. Dispatch to short-input by non-empty line count, not raw line\n" +
+        "     count. A 2-content-line copy with a trailing newline has\n" +
+        "     lines.count == 3 but only 2 non-empty lines.\n" +
+        "\n" +
+        "  2. Hanging-indent residue is relative to the baseline indent.\n" +
+        "     Uniformly-indented content leaves every line at the same\n" +
+        "     residue depth after Path A's strip.\n" +
+        "\n" +
+        "  3. Indent reset ends a hanging-indent block.\n"
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "numbered-list content detected")
+    if let r = result {
+        check(r.contains("1. Dispatch"), "item 1 preserved")
+        check(r.contains("not raw line count"), "item 1 continuation joined")
+        check(r.contains("2. Hanging-indent"), "item 2 preserved")
+        check(r.contains("3. Indent reset"), "item 3 preserved")
+    }
+}
+
 // MARK: - Negatives
 
 group("N1: Plain text") {
@@ -709,6 +738,49 @@ group("S12: Two padded lines with interleaved blank → cleaned, paragraph prese
     check(result != nil, "2-content-line + interleaved blank detected")
     if let r = result {
         check(r == "First paragraph.\n\nSecond paragraph.", "interleaved blank line preserved")
+    }
+}
+
+// MARK: - Indent Baseline (Hanging-Indent Relativity)
+
+group("I1: Uniform deep indent — trailing short line stays on its own line") {
+    // Heredoc-style content: every line has 4-space leading. After Path A
+    // strips 2 leading, every line has 2-space residue — that's the document
+    // baseline, not a hanging-indent signal. The trailing "EOF" line is
+    // short and the previous line didn't fill the wrap column, so the
+    // terminal had no reason to wrap. EOF must stay on its own line.
+    let input =
+        "    Short Claude paragraphs (3-4 lines) with one hanging-indent               \n" +
+        "    continuation miss detection: only 3 of 4 lines satisfy \"exactly 2         \n" +
+        "    leading spaces\", failing the >=4 floor even when the 60% ratio gate       \n" +
+        "    passes by a wide margin. Ratio gate still rejects code (test B4).         \n" +
+        "                                                                              \n" +
+        "    Test updates: B3 rephrased for the 2-line case, B3b added (3 bullets      \n" +
+        "    fires), E1 input updated.                                                 \n" +
+        "                                                                              \n" +
+        "    All 125 tests pass.                                                       \n" +
+        "    EOF                                                                       "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "deep-indent content detected")
+    if let r = result {
+        check(r.contains("\nEOF"), "EOF on its own line")
+        check(!r.contains("pass. EOF"), "EOF not joined to previous line")
+    }
+}
+
+group("I2: Mixed indent — deeper lines join, baseline reset breaks paragraph") {
+    // Baseline = 0 (most lines flush left after Path A strips 2 leading).
+    // A line deeper than baseline IS a real hanging-indent continuation
+    // and should still join, even when word-fit math wouldn't fire.
+    let input =
+        "  Some prose ends with a colon:                                         \n" +
+        "    nested hanging continuation here.                                   \n" +
+        "  More flush-left prose follows.                                        "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "mixed-indent content detected")
+    if let r = result {
+        check(r.contains("colon: nested hanging continuation"), "deeper line joined as continuation")
+        check(r.contains("\nMore flush-left prose"), "flush-left line stays separate")
     }
 }
 
