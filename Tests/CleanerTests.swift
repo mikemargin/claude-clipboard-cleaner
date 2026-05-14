@@ -123,8 +123,21 @@ group("B2: No ⏺, leading 2-space only") {
     if let r = result { check(r.hasPrefix("- First"), "leading stripped") }
 }
 
-group("B3: Below 4-line threshold") {
-    check(cleanClaudeOutput("  - One\n  - Two\n  - Three") == nil, "rejected")
+group("B3: Below 3-line threshold") {
+    // Path B requires ≥3 exactly-2-space lines (lowered from 4 so that short
+    // 3-or-4-line Claude paragraphs detect; see hasLeadingTwoSpacePattern).
+    // 2 bullets fall under the short-input path which requires both signals.
+    check(cleanClaudeOutput("  - One\n  - Two") == nil, "2 lines below threshold")
+}
+
+group("B3b: Three-line all-bullets fires (post-threshold-change)") {
+    // Documents the deliberate behavior change: 3 bullet items with exactly
+    // 2-space leading is Claude output and gets cleaned.
+    let result = cleanClaudeOutput("  - One\n  - Two\n  - Three")
+    check(result != nil, "3 bullets detected")
+    if let r = result {
+        check(r == "- One\n- Two\n- Three", "leading stripped")
+    }
 }
 
 group("B4: Mixed-depth code rejected") {
@@ -135,6 +148,35 @@ group("B4: Mixed-depth code rejected") {
 group("B5: Below 60% ratio") {
     let input = "Title\nAnother\nThird\n  - One\n  - Two\n  - Three\n  - Four\nFooter\nMore\nEnd"
     check(cleanClaudeOutput(input) == nil, "40% rejected")
+}
+
+group("B6: Numbered list with 5-space continuations — relaxed ratio fires") {
+    // Real failure mode: Claude formats numbered lists with hanging
+    // continuations at 5 leading spaces. "Exactly 2" ratio dropped below
+    // 60% when continuations dominated. The relaxed rule counts >=2
+    // leading toward the ratio (continuations still vote) while keeping a
+    // >=3 exactly-2 absolute floor (so an all-deeper-indent code block
+    // still gets rejected per B4).
+    let input =
+        "  Three follow-ups uncovered while testing:\n" +
+        "\n" +
+        "  1. Dispatch to short-input by non-empty line count, not raw line\n" +
+        "     count. A 2-content-line copy with a trailing newline has\n" +
+        "     lines.count == 3 but only 2 non-empty lines.\n" +
+        "\n" +
+        "  2. Hanging-indent residue is relative to the baseline indent.\n" +
+        "     Uniformly-indented content leaves every line at the same\n" +
+        "     residue depth after Path A's strip.\n" +
+        "\n" +
+        "  3. Indent reset ends a hanging-indent block.\n"
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "numbered-list content detected")
+    if let r = result {
+        check(r.contains("1. Dispatch"), "item 1 preserved")
+        check(r.contains("not raw line count"), "item 1 continuation joined")
+        check(r.contains("2. Hanging-indent"), "item 2 preserved")
+        check(r.contains("3. Indent reset"), "item 3 preserved")
+    }
 }
 
 // MARK: - Negatives
@@ -604,10 +646,150 @@ group("R6: KR+EN mixed with list — real Claude output pattern") {
     }
 }
 
+// MARK: - Short Input (1-2 lines)
+
+group("S1: Single line — leading 2-space + trailing pad → cleaned") {
+    let input = "  Plan promise: Flip sandbox.enabled default to true.                                  "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "single line detected")
+    if let r = result {
+        check(r == "Plan promise: Flip sandbox.enabled default to true.", "leading and trailing stripped")
+    }
+}
+
+group("S2: Single line — leading only (no trailing pad) → not cleaned") {
+    // Looks like indented code; no terminal-padding signal.
+    check(cleanClaudeOutput("  return foo()") == nil, "indented code rejected")
+}
+
+group("S3: Single line — trailing only (no leading) → not cleaned") {
+    check(cleanClaudeOutput("Hello world.   ") == nil, "no leading 2-space rejected")
+}
+
+group("S4: Single line — neither signal → not cleaned") {
+    check(cleanClaudeOutput("Hello world.") == nil, "plain single line rejected")
+}
+
+group("S5: Single line — deeper leading (4-space hanging) + pad → fully stripped") {
+    // Hanging-indent continuation copied alone. Strip all leading + trailing.
+    let input = "    that try to cat ~/.ssh/... under sandbox.                                "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "deeper leading detected")
+    if let r = result {
+        check(r == "that try to cat ~/.ssh/... under sandbox.", "all leading stripped")
+    }
+}
+
+group("S6: Single line + trailing newline → still cleaned") {
+    let input = "  Plan promise: Flip sandbox.                              \n"
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "single line with trailing \\n detected")
+    if let r = result {
+        check(r == "Plan promise: Flip sandbox.", "stripped to clean text")
+    }
+}
+
+group("S7: Two non-empty lines — both signals on both → cleaned and joined") {
+    // Both lines carry the terminal-copy fingerprint and the second is a wrap
+    // continuation of the first — unwrap should join them.
+    let input = "  Plan: we should ship this feature                              \n  before the deadline.                              "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "2-line short input detected")
+    if let r = result {
+        check(r == "Plan: we should ship this feature before the deadline.", "wrap continuation joined")
+    }
+}
+
+group("S8: Two lines, one missing trailing pad → rejected") {
+    let input = "  Line one                              \n  Line two"
+    check(cleanClaudeOutput(input) == nil, "missing trailing on one line rejects")
+}
+
+group("S9: Two lines, one missing leading 2-space → rejected") {
+    let input = "  Line one                              \nLine two                              "
+    check(cleanClaudeOutput(input) == nil, "missing leading on one line rejects")
+}
+
+group("S10: Two-line bullets → cleaned but not joined (structural)") {
+    let input = "  - First bullet                              \n  - Second bullet                              "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "2-line bullets detected")
+    if let r = result {
+        check(r == "- First bullet\n- Second bullet", "bullets preserved as separate lines")
+    }
+}
+
+group("S11: Two padded lines + trailing newline → cleaned (dispatch by non-empty count)") {
+    // Real failure mode from user: copying 2 lines from a terminal often
+    // includes a trailing newline, making lines.count == 3 but only 2 are
+    // non-empty. Multi-line path can't vote on 2 lines; short path must
+    // pick it up.
+    let input = "  git checkout -b cleaner-improvements                              \n  next line here.                              \n"
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "2-content-line + trailing newline detected")
+    if let r = result {
+        check(r == "git checkout -b cleaner-improvements next line here.", "lines joined per word-fit")
+    }
+}
+
+group("S12: Two padded lines with interleaved blank → cleaned, paragraph preserved") {
+    let input = "  First paragraph.                              \n\n  Second paragraph.                              "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "2-content-line + interleaved blank detected")
+    if let r = result {
+        check(r == "First paragraph.\n\nSecond paragraph.", "interleaved blank line preserved")
+    }
+}
+
+// MARK: - Indent Baseline (Hanging-Indent Relativity)
+
+group("I1: Uniform deep indent — trailing short line stays on its own line") {
+    // Heredoc-style content: every line has 4-space leading. After Path A
+    // strips 2 leading, every line has 2-space residue — that's the document
+    // baseline, not a hanging-indent signal. The trailing "EOF" line is
+    // short and the previous line didn't fill the wrap column, so the
+    // terminal had no reason to wrap. EOF must stay on its own line.
+    let input =
+        "    Short Claude paragraphs (3-4 lines) with one hanging-indent               \n" +
+        "    continuation miss detection: only 3 of 4 lines satisfy \"exactly 2         \n" +
+        "    leading spaces\", failing the >=4 floor even when the 60% ratio gate       \n" +
+        "    passes by a wide margin. Ratio gate still rejects code (test B4).         \n" +
+        "                                                                              \n" +
+        "    Test updates: B3 rephrased for the 2-line case, B3b added (3 bullets      \n" +
+        "    fires), E1 input updated.                                                 \n" +
+        "                                                                              \n" +
+        "    All 125 tests pass.                                                       \n" +
+        "    EOF                                                                       "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "deep-indent content detected")
+    if let r = result {
+        check(r.contains("\nEOF"), "EOF on its own line")
+        check(!r.contains("pass. EOF"), "EOF not joined to previous line")
+    }
+}
+
+group("I2: Mixed indent — deeper lines join, baseline reset breaks paragraph") {
+    // Baseline = 0 (most lines flush left after Path A strips 2 leading).
+    // A line deeper than baseline IS a real hanging-indent continuation
+    // and should still join, even when word-fit math wouldn't fire.
+    let input =
+        "  Some prose ends with a colon:                                         \n" +
+        "    nested hanging continuation here.                                   \n" +
+        "  More flush-left prose follows.                                        "
+    let result = cleanClaudeOutput(input)
+    check(result != nil, "mixed-indent content detected")
+    if let r = result {
+        check(r.contains("colon: nested hanging continuation"), "deeper line joined as continuation")
+        check(r.contains("\nMore flush-left prose"), "flush-left line stays separate")
+    }
+}
+
 // MARK: - Edge Cases
 
 group("E1: Below both thresholds") {
-    let input = "⏺ Title  \n  Line one \n  Line two  \n  Line three "
+    // Trailing pads are <3 (Path A fails), and only 2 lines have exactly
+    // 2-space leading (Path B's count of 3 fails).
+    let input = "⏺ Title  \n  Line one \nplain text\n  Line two  "
     check(cleanClaudeOutput(input) == nil, "below both paths")
 }
 
