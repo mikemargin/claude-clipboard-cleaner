@@ -40,5 +40,13 @@ if [ ! -f build/menubar_icon.png ]; then
 fi
 cp build/menubar_icon.png "$APP_BUNDLE/Contents/Resources/"
 
+# Standalone CLI for stdin testing (bypasses the menubar app — useful for
+# reproducing clipboard payloads without restarting the running instance).
+echo "🔨 Compiling clean_string CLI..."
+cat CleanLogic.swift scripts/clean_string.swift > "$BUILD_DIR/clean_string_main.swift"
+swiftc -O -target arm64-apple-macosx13.0 \
+    -o "$BUILD_DIR/clean_string" "$BUILD_DIR/clean_string_main.swift"
+
 echo "✅ Built: $APP_BUNDLE"
 echo "   Run: open \"$APP_BUNDLE\""
+echo "   CLI: pbpaste | $BUILD_DIR/clean_string"
