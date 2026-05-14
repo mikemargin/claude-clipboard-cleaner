@@ -6,6 +6,8 @@ APP_NAME="Claude Clipboard Cleaner"
 BUNDLE_ID="ClaudeClipboardCleaner"
 BUILD_DIR="build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
+ZIP_PATH="$BUILD_DIR/$BUNDLE_ID.zip"
+DMG_PATH="$BUILD_DIR/$BUNDLE_ID.dmg"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
@@ -47,6 +49,26 @@ cat CleanLogic.swift scripts/clean_string.swift > "$BUILD_DIR/clean_string_main.
 swiftc -O -target arm64-apple-macosx13.0 \
     -o "$BUILD_DIR/clean_string" "$BUILD_DIR/clean_string_main.swift"
 
-echo "✅ Built: $APP_BUNDLE"
-echo "   Run: open \"$APP_BUNDLE\""
-echo "   CLI: pbpaste | $BUILD_DIR/clean_string"
+# DMG background (generate if missing)
+if [ ! -f build/dmg_background.png ]; then
+    echo "🎨 Generating DMG background..."
+    swiftc -O -target arm64-apple-macosx13.0 -framework AppKit \
+        -o build/generate_dmg_background scripts/generate_dmg_background.swift
+    ./build/generate_dmg_background
+fi
+
+# Package for distribution. ditto preserves macOS metadata (and code signature
+# when present); the unsigned outputs from this script will still trigger
+# Gatekeeper warnings — use build-mac-signed.sh for notarized releases.
+echo "Packaging zip..."
+rm -f "$ZIP_PATH"
+ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+
+echo "Packaging dmg..."
+./scripts/make_polished_dmg.sh "$APP_BUNDLE" "$DMG_PATH" build/dmg_background.png "$APP_NAME"
+
+echo "✅ Built:"
+echo "   App: $APP_BUNDLE"
+echo "   Zip: $ZIP_PATH"
+echo "   DMG: $DMG_PATH"
+echo "   CLI: $BUILD_DIR/clean_string  (pbpaste | $BUILD_DIR/clean_string)"
